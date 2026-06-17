@@ -5,17 +5,13 @@ A minimal, standalone gateway that provides **OpenAI-compatible** and **Anthropi
 ## Architecture
 
 ```
-┌───────────────────┐                    ┌──────────────────────┐                  ┌───────────────────────┐
-│   Upper App        │                    │   Copilot Gateway     │                  │  GitHub Copilot API   │
-│                    │                    │                      │                  │                       │
-│ OpenAI SDK ───────▶│ /v1/chat/completions│                     │                  │ /chat/completions     │
-│                    │ /v1/responses      │                      │                  │ /responses            │
-│                    │                    │   Route by model     │                  │                       │
-│ Anthropic SDK ────▶│ /v1/messages       │── supported_endpoints│                  │ /v1/messages          │
-│                    │                    │   + protocol convert │                  │   (if supported)      │
-│                    │                    │                      │                  │                       │
-│                    │◀─ SSE stream ──────│                      │◀─ SSE stream ────│                       │
-└───────────────────┘                    └──────────────────────┘                  └───────────────────────┘
+┌───── Upper App ─────┐                      ┌── Copilot Gateway ──┐                      ┌ GitHub Copilot API ─┐
+│  OpenAI SDK         │──── OpenAI request ─▶│  • same API         │──── forward (same) ─▶│  /chat/completions  │
+│                     │                      │    → forward        │                      │  /responses         │
+│  Anthropic SDK      │─ Anthropic request ─▶│  • different API    │── convert (An↔OAI) ─▶│  /v1/messages       │
+│                     │                      │    → convert        │                      │  (Claude only)      │
+│                     │◀── SSE stream ───────│                     │◀── SSE stream ───────│                     │
+└─────────────────────┘                      └─────────────────────┘                      └─────────────────────┘
 ```
 
 ## Quick Start
@@ -134,43 +130,67 @@ response = client.messages.create(
 print(response.content[0].text)
 ```
 
+### Claude Code
+
+Start [Claude Code](https://docs.anthropic.com/en/docs/claude-code) against the gateway by setting these environment variables, then launch `claude`:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:9992
+export ANTHROPIC_AUTH_TOKEN=dummy
+export ANTHROPIC_MODEL=claude-opus-4.8
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4.8
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4.6
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4.5
+export CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-4.5
+export DISABLE_NON_ESSENTIAL_MODEL_CALLS=1
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export IS_SANDBOX=1
+export ENABLE_TOOL_SEARCH=true
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+
+# Then start Claude Code
+claude --dangerously-skip-permissions
+```
+
+> **Note:** Model IDs must match what the Copilot API exposes. Run `curl http://localhost:9992/v1/models | python3 -m json.tool` to see available models and pick the ones you want.
+
 ## Configuration
 
-| Env Variable | Default | Description |
-|---|---|---|
-| `GATEWAY_PORT` | `9992` | Listen port |
-| `GATEWAY_HOST` | `0.0.0.0` | Listen host |
-| `GATEWAY_ENTERPRISE_DOMAIN` | _(empty)_ | GitHub Enterprise domain (e.g. `company.ghe.com`) |
-| `GATEWAY_TOKEN_FILE` | `~/.copilot-gateway/token.json` | OAuth token persistence path |
-| `GATEWAY_MODEL_REFRESH_SECS` | `300` | Model list refresh interval (seconds) |
-| `GATEWAY_NO_AUTH_PROMPT` | _(empty)_ | Set to `1` to skip interactive auth at startup |
+| Env Variable                 | Default                         | Description                                       |
+|------------------------------|---------------------------------|---------------------------------------------------|
+| `GATEWAY_PORT`               | `9992`                          | Listen port                                       |
+| `GATEWAY_HOST`               | `0.0.0.0`                       | Listen host                                       |
+| `GATEWAY_ENTERPRISE_DOMAIN`  | _(empty)_                       | GitHub Enterprise domain (e.g. `company.ghe.com`) |
+| `GATEWAY_TOKEN_FILE`         | `~/.copilot-gateway/token.json` | OAuth token persistence path                      |
+| `GATEWAY_MODEL_REFRESH_SECS` | `300`                           | Model list refresh interval (seconds)             |
+| `GATEWAY_NO_AUTH_PROMPT`     | _(empty)_                       | Set to `1` to skip interactive auth at startup    |
 
 ## API Endpoints
 
 ### LLM Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/v1/models` | List models (OpenAI format, includes `supported_endpoints`, `anthropic_native`) |
-| `GET` | `/v1/models/debug` | Full parsed model metadata (pricing, limits, capabilities) |
-| `GET` | `/v1/models/raw` | **Untouched** upstream Copilot `/models` JSON — for inspecting raw Copilot data |
-| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/responses` | OpenAI Responses API |
-| `POST` | `/v1/messages` | Anthropic Messages API |
+| Method | Path                   | Description                                                                     |
+|--------|------------------------|---------------------------------------------------------------------------------|
+| `GET`  | `/v1/models`           | List models (OpenAI format, includes `supported_endpoints`, `anthropic_native`) |
+| `GET`  | `/v1/models/debug`     | Full parsed model metadata (pricing, limits, capabilities)                      |
+| `GET`  | `/v1/models/raw`       | **Untouched** upstream Copilot `/models` JSON — for inspecting raw Copilot data |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions                                                         |
+| `POST` | `/v1/responses`        | OpenAI Responses API                                                            |
+| `POST` | `/v1/messages`         | Anthropic Messages API                                                          |
 
 ### Auth Endpoints
 
-| Method | Path | Description |
-|---|---|---|
+| Method | Path           | Description                     |
+|--------|----------------|---------------------------------|
 | `POST` | `/auth/device` | Initiate OAuth device code flow |
-| `POST` | `/auth/token` | Poll for access token |
-| `GET` | `/auth/status` | Check authentication status |
+| `POST` | `/auth/token`  | Poll for access token           |
+| `GET`  | `/auth/status` | Check authentication status     |
 
 ### Health
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Health check (`{"status":"ok","authenticated":true,"models_count":N}`) |
+| Method | Path      | Description                                                            |
+|--------|-----------|------------------------------------------------------------------------|
+| `GET`  | `/health` | Health check (`{"status":"ok","authenticated":true,"models_count":N}`) |
 
 ## Routing Logic
 

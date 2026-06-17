@@ -1,13 +1,13 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "copilot-gateway"
 version = "0.1.0"
 description = "A minimal, standalone gateway providing OpenAI & Anthropic-compatible API endpoints to access GitHub Copilot's LLM services"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
     {name = "ftian1", email = "ftian1@users.noreply.github.com"},
@@ -16,7 +16,6 @@ keywords = ["github", "copilot", "openai", "anthropic", "gateway", "llm", "api"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -33,6 +32,9 @@ dependencies = [
 
 [project.scripts]
 copilot-gateway = "main:main"
+
+[tool.setuptools]
+py-modules = ["auth", "config", "convert", "main", "models", "proxy"]
 
 [project.urls]
 Homepage = "https://github.com/ftian1/copilot-gateway"
