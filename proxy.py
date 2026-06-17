@@ -93,6 +93,76 @@ def detect_vision_request(body: dict) -> bool:
     return False
 
 
+# Anthropic fields that Copilot's /v1/messages endpoint rejects
+_ANTHROPIC_UNSUPPORTED_FIELDS = [
+    "context_management",
+]
+
+# Map thinking budget_tokens to Copilot effort levels
+_THINKING_BUDGET_TO_EFFORT = [
+    (2000, "low"),
+    (8000, "medium"),
+    (16000, "high"),
+    (32000, "xhigh"),
+]
+
+
+def _effort_from_budget(budget_tokens: int) -> str:
+    """Map a thinking budget to a Copilot effort level."""
+    for threshold, effort in _THINKING_BUDGET_TO_EFFORT:
+        if budget_tokens <= threshold:
+            return effort
+    return "xhigh"
+
+
+def _sanitize_anthropic_body(body: dict, model: "CopilotModel | None" = None) -> dict:
+    """Remove / convert Anthropic-API fields that Copilot's /v1/messages doesn't support.
+
+    Returns a (possibly modified) copy of the body.
+    """
+    dropped = [k for k in _ANTHROPIC_UNSUPPORTED_FIELDS if k in body]
+    if dropped:
+        body = {k: v for k, v in body.items() if k not in _ANTHROPIC_UNSUPPORTED_FIELDS}
+        logger.info(f"Stripped unsupported Anthropic fields: {dropped}")
+
+    # Strip all reasoning fields for models that don't support reasoning at all
+    if model and not model.supports_reasoning:
+        stripped = [k for k in ("thinking", "output_config") if k in body]
+        if stripped:
+            body = {k: v for k, v in body.items() if k not in ("thinking", "output_config")}
+            logger.info(f"Stripped reasoning fields for {model.id}: {stripped}")
+        return body
+
+    # Models that support reasoning but not effort (e.g. haiku-4.5):
+    # convert thinking, but always strip output_config (not supported)
+    if model and not model.reasoning_efforts:
+        if "output_config" in body:
+            body = {k: v for k, v in body.items() if k != "output_config"}
+            logger.info(f"Stripped output_config for {model.id} (no effort levels)")
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            body = dict(body)
+            body["thinking"] = {"type": "adaptive"}
+            logger.info(
+                f"Converted thinking: enabled → adaptive for {model.id} (no effort)"
+            )
+        return body
+
+    # Full effort support: convert thinking.type=enabled → adaptive + effort
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens", 16000)
+        body = dict(body)
+        body["thinking"] = {"type": "adaptive"}
+        body["output_config"] = {"effort": _effort_from_budget(budget)}
+        logger.info(
+            f"Converted thinking: enabled(budget={budget}) → "
+            f"adaptive(effort={_effort_from_budget(budget)})"
+        )
+
+    return body
+
+
 class ProxyHandler:
     """Handles proxying LLM requests to GitHub Copilot API."""
 
@@ -228,13 +298,14 @@ class ProxyHandler:
     ) -> Response:
         """Forward an Anthropic request directly to Copilot's /v1/messages endpoint."""
         base_url = self._config.api_base_url
-        # Anthropic Messages API is at /v1 on the Copilot API
         upstream_url = f"{base_url}/v1/messages"
 
         headers = self._build_upstream_headers(body, request.headers)
-        # Add Anthropic-specific headers
         headers["anthropic-version"] = "2023-06-01"
         headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+
+        # Strip Anthropic fields that Copilot's /v1/messages doesn't support
+        body = _sanitize_anthropic_body(body, model)
 
         is_stream = body.get("stream", False)
         model_id = body.get("model", "")
@@ -294,6 +365,7 @@ class ProxyHandler:
         # Convert OpenAI → Anthropic request
         anth_body = openai_to_anthropic_request(body)
         anth_body["stream"] = is_stream
+        anth_body = _sanitize_anthropic_body(anth_body, model)
 
         base_url = self._config.api_base_url
         upstream_url = f"{base_url}/v1/messages"
@@ -430,12 +502,16 @@ class ProxyHandler:
             )
         else:
             resp = await self._client.post(url, json=body, headers=headers)
-            # Record usage from successful non-streaming response
             if resp.is_success:
                 try:
                     self._record_usage(model_id, resp.json(), api_type)
                 except Exception:
-                    pass  # don't fail the request over usage tracking
+                    pass
+            else:
+                logger.error(
+                    f"Upstream {resp.status_code} (model={model_id}): "
+                    f"{resp.text[:300]}"
+                )
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,

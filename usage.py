@@ -187,17 +187,32 @@ def _k(n: int) -> str:
     return f"{n//1000}K"
 
 
-def print_usage_table(tracker: "UsageTracker") -> None:
-    """Print a compact running cost summary to stdout.
+# Last printed snapshot hash — only reprint when usage changes
+_last_hash = ""
 
-    Separator lines are sized to match the widest row.
+
+def print_usage_table(tracker: "UsageTracker") -> None:
+    """Print a compact running cost summary to stderr.
+
+    Only prints when token counts change — no repeated output when idle.
     """
+    import sys
+
+    global _last_hash
+
     snap = tracker.snapshot()
     models = snap.get("models", {})
     totals = snap.get("totals", {})
 
+    # Skip if nothing changed
+    h = f"{len(models)}:{totals.get('input_tokens',0)}:{totals.get('output_tokens',0)}"
+    if h == _last_hash and _last_hash != "":
+        return
+    _last_hash = h
+
     if not models:
-        print("── Usage ── (no requests yet)", flush=True)
+        sys.stderr.write("── Usage ── (no requests yet, waiting...)\n")
+        sys.stderr.flush()
         return
 
     # Build all lines
@@ -208,13 +223,13 @@ def print_usage_table(tracker: "UsageTracker") -> None:
             f"  {mid:<22s}  req:{u['requests']:>5d}  "
             f"in:{_k(u['input_tokens']):>6s}  out:{_k(u['output_tokens']):>6s}",
         ]
-        # Only show cache columns if there is cache activity
         if u["cache_read_tokens"] > 0 or u["cache_write_tokens"] > 0:
             parts.append(
                 f"  cache_r:{_k(u['cache_read_tokens']):>5s}  cache_w:{_k(u['cache_write_tokens']):>5s}"
             )
         parts.append(f"  ${u['cost_usd']:.4f}")
         lines.append("".join(parts))
+
     # TOTAL line
     total_parts = [
         f"  {'TOTAL':<22s}  req:{totals['requests']:>5d}  "
@@ -229,14 +244,14 @@ def print_usage_table(tracker: "UsageTracker") -> None:
     total_parts.append(f"  ${totals['cost_usd']:.4f}")
     lines.append("".join(total_parts))
 
-    # Compute max visual length
     max_w = max(len(line) for line in lines)
     sep = "─" * max_w
 
-    print("", flush=True)
-    print("── Usage ──", flush=True)
-    print(sep, flush=True)
-    for line in lines[1:]:  # model rows + TOTAL
-        print(line, flush=True)
-    print(sep, flush=True)
-    print("", flush=True)
+    out: list[str] = []
+    out.append("── Usage ──")
+    out.append(sep)
+    out.extend(lines[1:])
+    out.append(sep)
+
+    sys.stderr.write("\n".join(out) + "\n")
+    sys.stderr.flush()
