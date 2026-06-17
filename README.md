@@ -5,13 +5,13 @@ A minimal, standalone gateway that provides **OpenAI-compatible** and **Anthropi
 ## Architecture
 
 ```
-┌───── Upper App ─────┐                      ┌── Copilot Gateway ──┐                      ┌ GitHub Copilot API ─┐
-│  OpenAI SDK         │──── OpenAI request ─▶│  • same API         │──── forward (same) ─▶│  /chat/completions  │
-│                     │                      │    → forward        │                      │  /responses         │
-│  Anthropic SDK      │─ Anthropic request ─▶│  • different API    │── convert (An↔OAI) ─▶│  /v1/messages       │
-│                     │                      │    → convert        │                      │  (Claude only)      │
-│                     │◀── SSE stream ───────│                     │◀── SSE stream ───────│                     │
-└─────────────────────┘                      └─────────────────────┘                      └─────────────────────┘
+┌── Upper App ───┐                      ┌── Copilot Gateway ──┐                      ┌ GitHub Copilot API ─┐
+│  OpenAI SDK    │──── OpenAI request ─>│  • same API         │──── forward (same) ─>│  /chat/completions  │
+│                │                      │    → forward        │                      │  /responses         │
+│  Anthropic SDK │─ Anthropic request ─>│  • different API    │── convert (An↔OAI) ─>│  /v1/messages       │
+│                │                      │    → convert        │                      │  (Claude only)      │
+│                │<── SSE stream ───────│                     │<── SSE stream ───────│                     │
+└────────────────┘                      └─────────────────────┘                      └─────────────────────┘
 ```
 
 ## Quick Start
@@ -220,12 +220,12 @@ Since GitHub Copilot moved to **per-token billing** (AI Credits = $0.01 each) on
 
 ```
 ── Usage ──
-───────────────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────────────────────────
   claude-opus-4.8         req:   12  in:   52K  out:   18K  cache_r:  30K  cache_w:   5K  $0.0710
   claude-sonnet-4-6       req:   47  in:  120K  out:   45K  cache_r:  80K  cache_w:  12K  $0.1035
   gpt-5                   req:   31  in:   80K  out:   32K  cache_r:  10K  cache_w:   0K  $0.0420
   TOTAL                   req:   90  in:  252K  out:   95K  cache_r: 120K  cache_w:  17K  $0.2165
-───────────────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 **JSON endpoint:**
