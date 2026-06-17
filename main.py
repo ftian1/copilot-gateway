@@ -51,6 +51,7 @@ from fastapi.responses import JSONResponse
 from config import load_config, CLIENT_ID
 from auth import AuthManager
 from models import ModelStore, print_model_table
+from usage import UsageTracker, print_usage_table
 from proxy import ProxyHandler
 
 # ── stdout buffering ───────────────────────────────────────────
@@ -127,7 +128,8 @@ config = load_config()
 _parse_args()  # apply CLI overrides (exits early on --help)
 auth = AuthManager(config)
 models = ModelStore(config, auth)
-proxy = ProxyHandler(config, auth, models)
+usage = UsageTracker()
+proxy = ProxyHandler(config, auth, models, usage)
 
 # Track the auth prompt task so we can cancel it on shutdown
 _auth_prompt_task: asyncio.Task | None = None
@@ -264,6 +266,15 @@ async def _run_startup_auth() -> None:
         )
 
 
+# ── usage printer ────────────────────────────────────────────────
+
+async def _print_usage_loop() -> None:
+    """Print running cost summary every 3 seconds."""
+    while True:
+        await asyncio.sleep(3)
+        print_usage_table(usage)
+
+
 # ── lifespan ───────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -282,6 +293,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Start model refresh loop (will retry once we have a token)
     await models.start_refresh_loop()
 
+    # Start usage printer (refreshes every 3 seconds)
+    _usage_task = asyncio.create_task(_print_usage_loop(), name="usage-printer")
+
     # Start auth prompt as a background task — server is already
     # accepting requests, so /auth endpoints work in parallel
     _auth_prompt_task = asyncio.create_task(
@@ -295,6 +309,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _auth_prompt_task.cancel()
         try:
             await _auth_prompt_task
+        except asyncio.CancelledError:
+            pass
+
+    if _usage_task and not _usage_task.done():
+        _usage_task.cancel()
+        try:
+            await _usage_task
         except asyncio.CancelledError:
             pass
 
@@ -351,6 +372,23 @@ async def list_models_raw():
     for inspecting the full model metadata that Copilot exposes.
     """
     return await proxy.list_raw_response()
+
+
+@app.get("/v1/usage")
+async def list_usage():
+    """Return cumulative token usage and estimated cost per model.
+
+    Token counts come from API response bodies and SSE streams.
+    Costs are computed using per-model pricing from the /models endpoint.
+    """
+    return JSONResponse(usage.snapshot())
+
+
+@app.delete("/v1/usage")
+async def reset_usage():
+    """Reset all usage counters to zero."""
+    usage.reset()
+    return JSONResponse({"status": "reset"})
 
 
 # ── OpenAI-compatible endpoints ────────────────────────────────

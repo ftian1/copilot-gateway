@@ -1,6 +1,6 @@
 # GitHub Copilot Gateway
 
-A minimal, standalone gateway that provides **OpenAI-compatible** and **Anthropic-compatible** API endpoints to access GitHub Copilot's LLM services. On first launch it walks you through GitHub OAuth device-code authentication right in the terminal. The token is persisted to disk so subsequent starts are instant.
+A minimal, standalone gateway that provides **OpenAI-compatible** and **Anthropic-compatible** API endpoints to access GitHub Copilot's LLM services. On first launch it walks you through GitHub OAuth device-code authentication right in the terminal. The token is persisted to disk so subsequent starts are instant. Tracks token usage and **prints a running cost summary every 3 seconds** — useful now that Copilot bills per token (AI Credits).
 
 ## Architecture
 
@@ -28,7 +28,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The gateway starts on `http://localhost:9992`. If no token is found, it auto-initiates the GitHub device-code flow and prints instructions to the terminal.
+The gateway starts on `http://localhost:9992`. If no token is found, it auto-initiates the GitHub device-code flow and prints instructions to the terminal. A **running cost summary** refreshes every 3 seconds right in the terminal — no extra flags needed.
 
 To skip the interactive prompt and auth via curl instead:
 
@@ -174,6 +174,7 @@ claude --dangerously-skip-permissions
 | `GET`  | `/v1/models`           | List models (OpenAI format, includes `supported_endpoints`, `anthropic_native`) |
 | `GET`  | `/v1/models/debug`     | Full parsed model metadata (pricing, limits, capabilities)                      |
 | `GET`  | `/v1/models/raw`       | **Untouched** upstream Copilot `/models` JSON — for inspecting raw Copilot data |
+| `GET`  | `/v1/usage`            | Cumulative token usage & estimated cost per model (live)                        |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions                                                         |
 | `POST` | `/v1/responses`        | OpenAI Responses API                                                            |
 | `POST` | `/v1/messages`         | Anthropic Messages API                                                          |
@@ -210,6 +211,32 @@ curl http://localhost:9992/v1/models | python3 -m json.tool
 ```
 
 Look at the `anthropic_native` and `supported_endpoints` fields per model.
+
+## Usage Tracking
+
+Since GitHub Copilot moved to **per-token billing** (AI Credits = $0.01 each) on June 1, 2026, the gateway tracks token usage from every API response — both streaming and non-streaming — and computes cost using each model's pricing from Copilot's own `/models` endpoint.
+
+**Terminal output:** A cost summary refreshes every 3 seconds, tracking input/output/cache tokens and estimated spend:
+
+```
+── Usage ──
+───────────────────────────────────────────────────────────────────────────────────────
+  claude-opus-4.8         req:   12  in:   52K  out:   18K  cache_r:  30K  cache_w:   5K  $0.0710
+  claude-sonnet-4-6       req:   47  in:  120K  out:   45K  cache_r:  80K  cache_w:  12K  $0.1035
+  gpt-5                   req:   31  in:   80K  out:   32K  cache_r:  10K  cache_w:   0K  $0.0420
+  TOTAL                   req:   90  in:  252K  out:   95K  cache_r: 120K  cache_w:  17K  $0.2165
+───────────────────────────────────────────────────────────────────────────────────────
+```
+
+**JSON endpoint:**
+
+```bash
+curl http://localhost:9992/v1/usage | python3 -m json.tool
+```
+
+Returns per-model breakdown with token counts and estimated cost. Reset counters with `DELETE /v1/usage`.
+
+> **Note:** The gateway computes cost from real token counts × Copilot's published per-model prices. It does not query GitHub's credit balance (no public API exists for that).
 
 ## Docker
 

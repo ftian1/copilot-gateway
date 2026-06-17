@@ -595,3 +595,330 @@ def finalize_anthropic_stream(request_key: str) -> str:
         "event: message_stop\n"
         'data: {"type":"message_stop"}\n'
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Reverse conversion: OpenAI → Anthropic (for models that only
+# speak Anthropic Messages API natively, e.g. Claude on Copilot)
+# ═══════════════════════════════════════════════════════════════
+
+def openai_to_anthropic_request(openai_body: dict) -> dict:
+    """Convert an OpenAI Chat Completions request to Anthropic Messages format."""
+    messages = openai_body.get("messages", [])
+    system_parts: list[dict] = []
+
+    # Extract system messages
+    anthropic_messages: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        if role == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                system_parts.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                system_parts.extend(content)
+        else:
+            anthropic_messages.append(_convert_openai_message_to_anthropic(msg))
+
+    anthropic_body: dict = {
+        "model": openai_body.get("model", ""),
+        "messages": anthropic_messages,
+        "max_tokens": openai_body.get("max_tokens", 4096),
+        "stream": openai_body.get("stream", False),
+    }
+
+    if system_parts:
+        anthropic_body["system"] = system_parts if len(system_parts) > 1 else system_parts[0] if system_parts else system_parts
+
+    if openai_body.get("temperature") is not None:
+        anthropic_body["temperature"] = openai_body["temperature"]
+    if openai_body.get("top_p") is not None:
+        anthropic_body["top_p"] = openai_body["top_p"]
+    if openai_body.get("stop"):
+        stop = openai_body["stop"]
+        anthropic_body["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+
+    # Tools
+    tools = openai_body.get("tools")
+    if tools:
+        anthropic_body["tools"] = [_convert_openai_tool_to_anthropic(t) for t in tools]
+        tool_choice = openai_body.get("tool_choice")
+        if tool_choice:
+            anthropic_body["tool_choice"] = _convert_tool_choice_to_anthropic(tool_choice)
+
+    return anthropic_body
+
+
+def _convert_openai_message_to_anthropic(msg: dict) -> dict:
+    """Convert a single OpenAI message to Anthropic format."""
+    role = msg.get("role", "user")
+    content = msg.get("content", "")
+
+    # Map roles
+    role_map = {"assistant": "assistant", "user": "user", "tool": "user", "function": "user"}
+    anth_role = role_map.get(role, "user")
+
+    if isinstance(content, str):
+        return {"role": anth_role, "content": [{"type": "text", "text": content}]}
+    elif isinstance(content, list):
+        blocks: list[dict] = []
+        for part in content:
+            if isinstance(part, dict):
+                part_type = part.get("type", "")
+                if part_type == "text":
+                    blocks.append({"type": "text", "text": part.get("text", "")})
+                elif part_type == "image_url":
+                    img = part.get("image_url", {})
+                    url = img.get("url", "") if isinstance(img, dict) else str(img)
+                    blocks.append(_openai_image_to_anthropic(url))
+                elif part_type == "input_image":
+                    blocks.append(_openai_image_to_anthropic(part))
+        if not blocks:
+            blocks = [{"type": "text", "text": str(content)}]
+        return {"role": anth_role, "content": blocks}
+
+    return {"role": anth_role, "content": [{"type": "text", "text": str(content)}]}
+
+
+def _openai_image_to_anthropic(source) -> dict:
+    """Convert an OpenAI image reference to an Anthropic image block."""
+    if isinstance(source, dict):
+        url = source.get("url", "")
+        detail = source.get("detail", "auto")
+    else:
+        url = str(source)
+        detail = "auto"
+
+    if url.startswith("data:image/"):
+        # data URL → base64 source
+        parts = url.split(",", 1)
+        if len(parts) == 2:
+            mime = parts[0].replace("data:", "").split(";")[0]
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime,
+                    "data": parts[1],
+                },
+            }
+
+    # URL → Anthropic image with URL source
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _convert_openai_tool_to_anthropic(tool: dict) -> Optional[dict]:
+    """Convert an OpenAI function tool to Anthropic format."""
+    if tool.get("type") != "function":
+        return None
+    func = tool.get("function", {})
+    return {
+        "name": func.get("name", ""),
+        "description": func.get("description", ""),
+        "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+    }
+
+
+def _convert_tool_choice_to_anthropic(tool_choice: Any) -> Optional[dict]:
+    """Convert OpenAI tool_choice to Anthropic format."""
+    if tool_choice == "auto":
+        return {"type": "auto"}
+    if tool_choice == "any" or tool_choice == "required":
+        return {"type": "any"}
+    if isinstance(tool_choice, dict):
+        func = tool_choice.get("function", {})
+        return {"type": "tool", "name": func.get("name", "")}
+    return None
+
+
+# ── Anthropic → OpenAI response conversion ─────────────────────
+
+def anthropic_to_openai_response(anth_body: dict, model_id: str = "") -> dict:
+    """Convert an Anthropic Messages response to OpenAI Chat Completions format."""
+    msg_id = anth_body.get("id", "")
+    content_blocks = anth_body.get("content", [])
+
+    # Build content string from blocks
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    for block in content_blocks:
+        if block.get("type") == "text":
+            text_parts.append(block.get("text", ""))
+        elif block.get("type") == "tool_use":
+            tc = {
+                "id": block.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                },
+            }
+            tool_calls.append(tc)
+
+    content = "\n".join(text_parts) if text_parts else ""
+    usage = anth_body.get("usage", {})
+
+    finish_map = {
+        "end_turn": "stop",
+        "max_tokens": "length",
+        "stop_sequence": "stop",
+        "tool_use": "tool_calls",
+    }
+
+    return {
+        "id": msg_id,
+        "object": "chat.completion",
+        "created": _uid_to_unix(msg_id),
+        "model": anth_body.get("model", model_id),
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content if content else None,
+                **({"tool_calls": tool_calls} if tool_calls else {}),
+            },
+            "finish_reason": finish_map.get(anth_body.get("stop_reason", ""), "stop"),
+        }],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens", 0) or 0,
+            "completion_tokens": usage.get("output_tokens", 0) or 0,
+            "total_tokens": (usage.get("input_tokens", 0) or 0) + (usage.get("output_tokens", 0) or 0),
+            "prompt_tokens_details": {
+                "cached_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+            },
+        },
+    }
+
+
+def _uid_to_unix(uid: str) -> int:
+    """Try to extract a Unix timestamp from an Anthropic message ID."""
+    import time
+    m = re.match(r"msg_(\d+)", uid)
+    if m:
+        try:
+            return int(m.group(1)) // 1_000_000
+        except (ValueError, OverflowError):
+            pass
+    return int(time.time())
+
+
+# ── Anthropic SSE → OpenAI SSE conversion ──────────────────────
+
+# Per-request state for streaming conversion
+_anth_sse_state: dict[str, dict] = {}
+
+
+def anthropic_sse_to_openai_sse(line: str, model_id: str = "") -> Optional[str]:
+    """Convert an Anthropic SSE event to an OpenAI-compatible SSE data: line.
+
+    Returns None for events that don't produce OpenAI output.
+    """
+    # Parse event type
+    if line.startswith("event: "):
+        event_type = line[7:].strip()
+        key = f"{model_id}_{id(line)}"  # approximate key
+        state = _get_anth_sse_state(key)
+        state["_last_event"] = event_type
+        return None  # event headers don't produce output directly
+
+    if not line.startswith("data: "):
+        return None
+
+    try:
+        data = json.loads(line[6:])
+    except json.JSONDecodeError:
+        return None
+
+    evt_type = data.get("type", "")
+    key = data.get("id", "unknown")  # use message ID as state key
+
+    if evt_type == "message_start":
+        state = _get_anth_sse_state(key)
+        state["model"] = data.get("message", {}).get("model", model_id)
+        state["id"] = data.get("message", {}).get("id", "")
+        msg = data.get("message", {})
+        # Emit a chunk with the role
+        return (
+            f'data: {{"id":"{state["id"]}","object":"chat.completion.chunk",'
+            f'"created":{_uid_to_unix(state["id"])},'
+            f'"model":"{state["model"]}","choices":[{{"index":0,'
+            f'"delta":{{"role":"assistant","content":""}},"finish_reason":null}}]}}\n'
+        )
+
+    elif evt_type == "content_block_start":
+        state = _get_anth_sse_state(key)
+        content_block = data.get("content_block", {})
+        idx = data.get("index", 0)
+        block_type = content_block.get("type", "text")
+        if block_type == "text":
+            state[f"block_{idx}_type"] = "text"
+        elif block_type == "tool_use":
+            state[f"block_{idx}_type"] = "tool_use"
+            state[f"tool_{idx}_id"] = content_block.get("id", "")
+            state[f"tool_{idx}_name"] = content_block.get("name", "")
+        return None
+
+    elif evt_type == "content_block_delta":
+        state = _get_anth_sse_state(key)
+        delta = data.get("delta", {})
+        idx = data.get("index", 0)
+        block_type = state.get(f"block_{idx}_type", "text")
+        delta_type = delta.get("type", "text_delta")
+
+        if delta_type == "text_delta":
+            text = delta.get("text", "")
+            return (
+                f'data: {{"id":"{state.get("id","")}","object":"chat.completion.chunk",'
+                f'"created":{_uid_to_unix(state.get("id",""))},'
+                f'"model":"{state.get("model",model_id)}","choices":[{{"index":0,'
+                f'"delta":{{"content":{json.dumps(text)}}},"finish_reason":null}}]}}\n'
+            )
+        elif delta_type == "input_json_delta":
+            state[f"tool_{idx}_args"] = (state.get(f"tool_{idx}_args", "") +
+                                         delta.get("partial_json", ""))
+
+    elif evt_type == "content_block_stop":
+        state = _get_anth_sse_state(key)
+        idx = data.get("index", 0)
+        if state.get(f"block_{idx}_type") == "tool_use":
+            tc_id = state.get(f"tool_{idx}_id", "")
+            tc_name = state.get(f"tool_{idx}_name", "")
+            tc_args = state.get(f"tool_{idx}_args", "{}")
+            return (
+                f'data: {{"id":"{state.get("id","")}","object":"chat.completion.chunk",'
+                f'"created":{_uid_to_unix(state.get("id",""))},'
+                f'"model":"{state.get("model",model_id)}","choices":[{{"index":0,'
+                f'"delta":{{"tool_calls":[{{"index":0,"id":{json.dumps(tc_id)},'
+                f'"type":"function","function":{{"name":{json.dumps(tc_name)},'
+                f'"arguments":{json.dumps(tc_args)}' + '}]},"finish_reason":"tool_calls"}]}\n'
+            )
+
+    elif evt_type == "message_delta":
+        state = _get_anth_sse_state(key)
+        usage = data.get("usage", {})
+        out_tokens = usage.get("output_tokens", 0)
+        return (
+            f'data: {{"id":"{state.get("id","")}","object":"chat.completion.chunk",'
+            f'"created":{_uid_to_unix(state.get("id",""))},'
+            f'"model":"{state.get("model",model_id)}","choices":[{{"index":0,'
+            f'"delta":{{}},"finish_reason":"stop"}}],'
+            f'"usage":{{"prompt_tokens":{usage.get("input_tokens",0)},'
+            f'"completion_tokens":{out_tokens},'
+            f'"total_tokens":{(usage.get("input_tokens",0) or 0) + out_tokens}}}}}\n'
+        )
+
+    elif evt_type == "message_stop":
+        _clear_anth_sse_state(key)
+        return "data: [DONE]\n"
+
+    return None
+
+
+def _get_anth_sse_state(key: str) -> dict:
+    if key not in _anth_sse_state:
+        _anth_sse_state[key] = {}
+    return _anth_sse_state[key]
+
+
+def _clear_anth_sse_state(key: str) -> None:
+    _anth_sse_state.pop(key, None)

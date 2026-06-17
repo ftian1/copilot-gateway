@@ -25,11 +25,20 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from config import API_VERSION, USER_AGENT, Config
 from auth import AuthManager
 from models import ModelStore, CopilotModel
+from usage import (
+    UsageTracker,
+    extract_openai_usage,
+    extract_responses_usage,
+    extract_anthropic_usage,
+)
 from convert import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
     openai_sse_to_anthropic_sse,
     finalize_anthropic_stream,
+    openai_to_anthropic_request,
+    anthropic_to_openai_response,
+    anthropic_sse_to_openai_sse,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,10 +96,11 @@ def detect_vision_request(body: dict) -> bool:
 class ProxyHandler:
     """Handles proxying LLM requests to GitHub Copilot API."""
 
-    def __init__(self, config: Config, auth: AuthManager, models: ModelStore):
+    def __init__(self, config: Config, auth: AuthManager, models: ModelStore, usage: UsageTracker):
         self._config = config
         self._auth = auth
         self._models = models
+        self._usage = usage
         self._client: Optional[httpx.AsyncClient] = None
 
     async def startup(self) -> None:
@@ -185,6 +195,14 @@ class ProxyHandler:
         base_url = self._config.api_base_url
 
         if api_type == "chat":
+            # Ensure streaming responses include usage (OpenAI requires this flag)
+            if is_stream and "stream_options" not in body:
+                body["stream_options"] = {"include_usage": True}
+            # If model doesn't support /chat/completions natively but speaks
+            # Anthropic, convert OpenAI → Anthropic → proxy → convert back
+            if model and "/v1/chat/completions" not in model.supported_endpoints:
+                if model.supports_anthropic_api:
+                    return await self._proxy_openai_via_anthropic(request, body, model)
             # Check if this model should use Responses API instead
             if model and model.is_gpt5:
                 upstream_url = f"{base_url}/responses"
@@ -201,7 +219,8 @@ class ProxyHandler:
         logger.debug(f"Proxying OpenAI {api_type} request to {upstream_url} (model={model_id}, stream={is_stream})")
 
         return await self._send_upstream(
-            upstream_url, headers, body, is_stream
+            upstream_url, headers, body, is_stream,
+            model_id=model_id, api_type=api_type,
         )
 
     async def _proxy_anthropic_native(
@@ -222,7 +241,10 @@ class ProxyHandler:
 
         logger.debug(f"Proxying Anthropic native request to {upstream_url} (model={model_id}, stream={is_stream})")
 
-        return await self._send_upstream(upstream_url, headers, body, is_stream)
+        return await self._send_upstream(
+            upstream_url, headers, body, is_stream,
+            model_id=model_id, api_type="anthropic",
+        )
 
     async def _proxy_anthropic_converted(
         self, request: Request, body: dict, model_id: str
@@ -258,27 +280,147 @@ class ProxyHandler:
                 upstream_url, headers, openai_body, model_id
             )
 
+    async def _proxy_openai_via_anthropic(
+        self, request: Request, body: dict, model: CopilotModel
+    ) -> Response:
+        """Convert OpenAI request to Anthropic, proxy, convert response back to OpenAI.
+
+        Used when a model only supports /v1/messages natively (e.g. Claude on Copilot)
+        but the client is speaking OpenAI Chat Completions.
+        """
+        model_id = body.get("model", "")
+        is_stream = body.get("stream", False)
+
+        # Convert OpenAI → Anthropic request
+        anth_body = openai_to_anthropic_request(body)
+        anth_body["stream"] = is_stream
+
+        base_url = self._config.api_base_url
+        upstream_url = f"{base_url}/v1/messages"
+
+        headers = self._build_upstream_headers(anth_body, request.headers)
+        headers["anthropic-version"] = "2023-06-01"
+        headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+
+        logger.debug(
+            f"Proxying OpenAI→Anthropic converted request to {upstream_url} "
+            f"(model={model_id}, stream={is_stream})"
+        )
+
+        if is_stream:
+            return await self._send_upstream_with_openai_sse_conversion(
+                upstream_url, headers, anth_body, model_id
+            )
+        else:
+            return await self._send_anthropic_and_convert_to_openai(
+                upstream_url, headers, anth_body, model_id
+            )
+
+    async def _send_anthropic_and_convert_to_openai(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict,
+        model_id: str,
+    ) -> Response:
+        """Send Anthropic request and convert response to OpenAI format."""
+        if not self._client:
+            raise RuntimeError("ProxyHandler not started")
+
+        try:
+            resp = await self._client.post(url, json=body, headers=headers)
+            if resp.is_success:
+                anth_response = resp.json()
+                self._record_usage(model_id, anth_response, "anthropic")
+                openai_response = anthropic_to_openai_response(anth_response, model_id)
+                return JSONResponse(openai_response)
+            else:
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    media_type="application/json",
+                )
+        except httpx.RequestError as e:
+            logger.error(f"Upstream Anthropic request failed: {e}")
+            return JSONResponse(
+                {"error": {"type": "upstream_error", "message": str(e)}},
+                status_code=502,
+            )
+
+    async def _send_upstream_with_openai_sse_conversion(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict,
+        model_id: str,
+    ) -> StreamingResponse:
+        """Send Anthropic streaming request and convert SSE to OpenAI format."""
+        async def event_generator():
+            if not self._client:
+                yield f"data: {{\"error\":\"Client not started\"}}\n\n"
+                return
+
+            try:
+                async with self._client.stream("POST", url, json=body, headers=headers) as resp:
+                    if not resp.is_success:
+                        error_text = await resp.aread()
+                        yield f"data: {{\"error\":{json.dumps(error_text.decode()[:500])}}}\n\n"
+                        return
+
+                    buffer = ""
+                    async for chunk in resp.aiter_text():
+                        buffer += chunk
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+
+                            if line.startswith("data: "):
+                                self._check_sse_line(line, model_id, "anthropic")
+
+                            converted = anthropic_sse_to_openai_sse(line, model_id)
+                            if converted:
+                                yield converted
+
+            except httpx.RequestError as e:
+                logger.error(f"Upstream streaming request failed: {e}")
+                yield f"data: {{\"error\":{json.dumps(str(e))}}}\n\n"
+            except Exception as e:
+                logger.exception(f"Unexpected error in SSE stream: {e}")
+                yield f"data: {{\"error\":{json.dumps(str(e))}}}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     async def _send_upstream(
         self,
         url: str,
         headers: dict[str, str],
         body: dict,
         is_stream: bool,
+        model_id: str = "",
+        api_type: str = "chat",
     ) -> Response:
         """Send request to upstream and return the response.
 
         For streaming requests, returns a StreamingResponse that proxies SSE.
-        For non-streaming, returns a JSONResponse.
+        For non-streaming, returns a JSONResponse and records token usage.
         """
         if not self._client:
             raise RuntimeError("ProxyHandler not started")
 
         if is_stream:
-            # For streaming, we need to stream the response
             req_headers = {**headers}
-            # Build the upstream request
             return StreamingResponse(
-                self._stream_upstream(url, req_headers, body),
+                self._stream_upstream(url, req_headers, body, model_id, api_type),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -288,6 +430,12 @@ class ProxyHandler:
             )
         else:
             resp = await self._client.post(url, json=body, headers=headers)
+            # Record usage from successful non-streaming response
+            if resp.is_success:
+                try:
+                    self._record_usage(model_id, resp.json(), api_type)
+                except Exception:
+                    pass  # don't fail the request over usage tracking
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -312,6 +460,9 @@ class ProxyHandler:
             resp = await self._client.post(url, json=body, headers=headers)
             if resp.is_success:
                 openai_response = resp.json()
+                # Record usage from the OpenAI response
+                self._record_usage(model_id, openai_response, "chat")
+                # Convert to Anthropic format
                 anthropic_response = openai_to_anthropic_response(openai_response, model_id)
                 return JSONResponse(anthropic_response)
             else:
@@ -362,6 +513,7 @@ class ProxyHandler:
                                 continue
 
                             if line.startswith("data: "):
+                                self._check_sse_line(line, model_id, "chat")
                                 converted = openai_sse_to_anthropic_sse(line, model_id)
                                 if converted:
                                     yield converted
@@ -394,8 +546,14 @@ class ProxyHandler:
         url: str,
         headers: dict[str, str],
         body: dict,
+        model_id: str = "",
+        api_type: str = "chat",
     ):
-        """Stream upstream SSE response directly to the client (OpenAI→OpenAI pass-through)."""
+        """Stream upstream SSE response, tracking usage from the final event.
+
+        OpenAI SSE: usage in the last data: chunk before [DONE].
+        Anthropic SSE: usage in the message_stop event.
+        """
         if not self._client:
             yield f"data: {{\"error\":\"Client not started\"}}\n\n"
             return
@@ -407,12 +565,102 @@ class ProxyHandler:
                     yield f"data: {{\"error\":{json.dumps(error_text.decode()[:500])}}}\n\n"
                     return
 
+                text_buf = ""
                 async for chunk in resp.aiter_bytes():
-                    yield chunk
+                    yield chunk  # pass through unchanged
+                    # Decode in parallel to scan for usage
+                    text_buf += chunk.decode(errors="ignore")
+                    while "\n" in text_buf:
+                        line, text_buf = text_buf.split("\n", 1)
+                        self._check_sse_line(line.strip(), model_id, api_type)
+                # Flush remaining
+                if text_buf.strip():
+                    self._check_sse_line(text_buf.strip(), model_id, api_type)
 
         except httpx.RequestError as e:
             logger.error(f"Upstream stream failed: {e}")
             yield f"data: {{\"error\":{json.dumps(str(e))}}}\n\n"
+
+    # ── usage tracking ─────────────────────────────────────────
+
+    def _record_usage(self, model_id: str, response_body: dict, api_type: str) -> None:
+        """Record token usage from an upstream response body.
+
+        api_type: "chat", "responses", or "anthropic"
+
+        Pricing differs by provider:
+          - Anthropic: cache reads at model.cache_read_price (deep discount, ~10%)
+          - OpenAI:    cache reads at 50% of input price (no separate cache_price API)
+        """
+        if not model_id:
+            return
+
+        model = self._models.get_model(model_id)
+        input_price = model.input_price if model else 0.0
+        output_price = model.output_price if model else 0.0
+
+        if api_type == "anthropic":
+            # Anthropic: use the model's explicit cache_read_price from Copilot
+            cache_read_price = model.cache_read_price if model else 0.0
+            in_tok, out_tok, cache_r, cache_w, reasoning = extract_anthropic_usage(response_body)
+            asyncio.ensure_future(self._usage.record(
+                model_id, input_tokens=in_tok, output_tokens=out_tok,
+                cache_read_tokens=cache_r, cache_write_tokens=cache_w,
+                reasoning_tokens=reasoning,
+                input_price_per_m=input_price, output_price_per_m=output_price,
+                cache_read_price_per_m=cache_read_price,
+            ))
+        else:
+            # OpenAI: cache hits are 50% of input price
+            # If Copilot provides a cache_price, use it; otherwise default to input * 0.5
+            cache_price = model.cache_read_price if model else 0.0
+            if cache_price <= 0:
+                cache_price = input_price * 0.5
+
+            if api_type == "responses":
+                in_tok, out_tok, cache_r, cache_w, reasoning = extract_responses_usage(response_body)
+            else:
+                in_tok, out_tok, cache_r, cache_w, reasoning = extract_openai_usage(response_body)
+
+            asyncio.ensure_future(self._usage.record(
+                model_id, input_tokens=in_tok, output_tokens=out_tok,
+                cache_read_tokens=cache_r, cache_write_tokens=cache_w,
+                reasoning_tokens=reasoning,
+                input_price_per_m=input_price, output_price_per_m=output_price,
+                cache_read_price_per_m=cache_price,
+            ))
+
+    def _check_sse_line(self, line: str, model_id: str, api_type: str) -> None:
+        """Check an SSE line for usage data and record it.
+
+        OpenAI SSE:  data: {..."usage":{"prompt_tokens":...}}
+        Anthropic SSE: event: message_stop → next data: line has usage
+        """
+        if not model_id or not line:
+            return
+
+        # Anthropic: track event type for message_stop
+        if api_type == "anthropic":
+            if line.startswith("event: ") and "message_stop" in line:
+                self._anth_sse_expecting_usage = True
+                return
+            if line.startswith("data: ") and getattr(self, "_anth_sse_expecting_usage", False):
+                self._anth_sse_expecting_usage = False
+                try:
+                    data = json.loads(line[6:])
+                    self._record_usage(model_id, data, "anthropic")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+                return
+
+        # OpenAI: look for usage in data: lines
+        if line.startswith("data: ") and "[DONE]" not in line:
+            try:
+                data = json.loads(line[6:])
+                if "usage" in data:
+                    self._record_usage(model_id, data, api_type)
+            except (json.JSONDecodeError, KeyError):
+                pass
 
     # ── header helpers ─────────────────────────────────────────
 
