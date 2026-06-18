@@ -77,7 +77,7 @@ def _parse_args() -> None:
         "-v", "--verbose",
         action="store_true",
         default=False,
-        help="Dump raw GitHub Copilot /models response at startup",
+        help="Verbose mode: enable debug logging (field stripping, thinking conversion, model refresh, per-request usage) and dump raw GitHub Copilot /models response at startup",
     )
     parser.add_argument(
         "-p", "--port",
@@ -101,6 +101,9 @@ def _parse_args() -> None:
 
     if args.verbose:
         config.verbose = True
+        # Verbose mode surfaces the demoted debug-level proxy/model logs
+        # (field stripping, thinking conversion, model refresh, per-request usage).
+        logging.getLogger().setLevel(logging.DEBUG)
     if args.port is not None:
         config.port = args.port
     if args.enterprise is not None:

@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
@@ -42,6 +43,42 @@ from convert import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Upstream rate-limit retry policy
+RETRYABLE_STATUS = {429, 503}
+MAX_RETRIES = 3            # attempts after the first try
+MAX_RETRY_DELAY = 30.0    # cap any single backoff wait (seconds)
+DEFAULT_RETRY_DELAY = 1.0  # base for exponential backoff when no Retry-After
+
+
+def _parse_retry_after(value: str) -> Optional[float]:
+    """Parse a Retry-After header value (delta-seconds form) into seconds.
+
+    Copilot sends delta-seconds (e.g. "5"). HTTP-date form is not used by the
+    upstream, so we only handle the numeric case and ignore anything else.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        secs = float(value)
+    except ValueError:
+        return None
+    if secs < 0:
+        return None
+    return secs
+
+
+def _retry_delay(resp: "httpx.Response", attempt: int) -> float:
+    """Compute how long to wait before the next retry.
+
+    Honors the upstream Retry-After header when present; otherwise falls back
+    to exponential backoff (1s, 2s, 4s, …). Always capped at MAX_RETRY_DELAY.
+    """
+    retry_after = _parse_retry_after(resp.headers.get("retry-after", ""))
+    if retry_after is not None:
+        return min(retry_after, MAX_RETRY_DELAY)
+    return min(DEFAULT_RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
 
 # Regex for detecting GPT-5+ models that should use Responses API
 GPT5_PATTERN = re.compile(r"^gpt-(\d+)")
@@ -123,14 +160,14 @@ def _sanitize_anthropic_body(body: dict, model: "CopilotModel | None" = None) ->
     dropped = [k for k in _ANTHROPIC_UNSUPPORTED_FIELDS if k in body]
     if dropped:
         body = {k: v for k, v in body.items() if k not in _ANTHROPIC_UNSUPPORTED_FIELDS}
-        logger.info(f"Stripped unsupported Anthropic fields: {dropped}")
+        logger.debug(f"Stripped unsupported Anthropic fields: {dropped}")
 
     # Strip all reasoning fields for models that don't support reasoning at all
     if model and not model.supports_reasoning:
         stripped = [k for k in ("thinking", "output_config") if k in body]
         if stripped:
             body = {k: v for k, v in body.items() if k not in ("thinking", "output_config")}
-            logger.info(f"Stripped reasoning fields for {model.id}: {stripped}")
+            logger.debug(f"Stripped reasoning fields for {model.id}: {stripped}")
         return body
 
     # Models that support reasoning but not effort (e.g. haiku-4.5):
@@ -138,12 +175,12 @@ def _sanitize_anthropic_body(body: dict, model: "CopilotModel | None" = None) ->
     if model and not model.reasoning_efforts:
         if "output_config" in body:
             body = {k: v for k, v in body.items() if k != "output_config"}
-            logger.info(f"Stripped output_config for {model.id} (no effort levels)")
+            logger.debug(f"Stripped output_config for {model.id} (no effort levels)")
         thinking = body.get("thinking")
         if isinstance(thinking, dict) and thinking.get("type") == "enabled":
             body = dict(body)
             body["thinking"] = {"type": "adaptive"}
-            logger.info(
+            logger.debug(
                 f"Converted thinking: enabled → adaptive for {model.id} (no effort)"
             )
         return body
@@ -155,7 +192,7 @@ def _sanitize_anthropic_body(body: dict, model: "CopilotModel | None" = None) ->
         body = dict(body)
         body["thinking"] = {"type": "adaptive"}
         body["output_config"] = {"effort": _effort_from_budget(budget)}
-        logger.info(
+        logger.debug(
             f"Converted thinking: enabled(budget={budget}) → "
             f"adaptive(effort={_effort_from_budget(budget)})"
         )
@@ -184,6 +221,63 @@ class ProxyHandler:
         """Close the HTTP client."""
         if self._client:
             await self._client.aclose()
+
+    # ── upstream send with rate-limit retry ────────────────────
+
+    async def _post_with_retry(
+        self, url: str, body: dict, headers: dict[str, str], model_id: str = ""
+    ) -> "httpx.Response":
+        """POST to upstream, retrying on 429/503 with Retry-After-aware backoff.
+
+        Returns the final httpx.Response (success or the last error response).
+        Network errors (httpx.RequestError) are not retried here — callers
+        already translate them into 502s.
+        """
+        assert self._client is not None
+        resp = await self._client.post(url, json=body, headers=headers)
+        attempt = 0
+        while resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+            delay = _retry_delay(resp, attempt)
+            logger.warning(
+                f"Upstream {resp.status_code} (model={model_id}), "
+                f"retry {attempt + 1}/{MAX_RETRIES} in {delay:.1f}s"
+            )
+            await resp.aclose()
+            await asyncio.sleep(delay)
+            resp = await self._client.post(url, json=body, headers=headers)
+            attempt += 1
+        return resp
+
+    @asynccontextmanager
+    async def _stream_with_retry(
+        self, url: str, body: dict, headers: dict[str, str], model_id: str = ""
+    ):
+        """Open an upstream streaming POST, retrying on 429/503 before any body.
+
+        Yields an open httpx.Response inside its stream context. Retry only
+        happens before the first byte is read, so callers can still surface a
+        clean error if every attempt fails. The caller must check is_success.
+        """
+        assert self._client is not None
+        attempt = 0
+        while True:
+            cm = self._client.stream("POST", url, json=body, headers=headers)
+            resp = await cm.__aenter__()
+            if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                delay = _retry_delay(resp, attempt)
+                logger.warning(
+                    f"Upstream {resp.status_code} (model={model_id}, stream), "
+                    f"retry {attempt + 1}/{MAX_RETRIES} in {delay:.1f}s"
+                )
+                await cm.__aexit__(None, None, None)
+                await asyncio.sleep(delay)
+                attempt += 1
+                continue
+            try:
+                yield resp
+            finally:
+                await cm.__aexit__(None, None, None)
+            return
 
     # ── public handlers ────────────────────────────────────────
 
@@ -400,7 +494,7 @@ class ProxyHandler:
             raise RuntimeError("ProxyHandler not started")
 
         try:
-            resp = await self._client.post(url, json=body, headers=headers)
+            resp = await self._post_with_retry(url, body, headers, model_id)
             if resp.is_success:
                 anth_response = resp.json()
                 self._record_usage(model_id, anth_response, "anthropic")
@@ -433,7 +527,7 @@ class ProxyHandler:
                 return
 
             try:
-                async with self._client.stream("POST", url, json=body, headers=headers) as resp:
+                async with self._stream_with_retry(url, body, headers, model_id) as resp:
                     if not resp.is_success:
                         error_text = await resp.aread()
                         yield f"data: {{\"error\":{json.dumps(error_text.decode()[:500])}}}\n\n"
@@ -501,7 +595,7 @@ class ProxyHandler:
                 },
             )
         else:
-            resp = await self._client.post(url, json=body, headers=headers)
+            resp = await self._post_with_retry(url, body, headers, model_id)
             if resp.is_success:
                 try:
                     self._record_usage(model_id, resp.json(), api_type)
@@ -533,7 +627,7 @@ class ProxyHandler:
             raise RuntimeError("ProxyHandler not started")
 
         try:
-            resp = await self._client.post(url, json=body, headers=headers)
+            resp = await self._post_with_retry(url, body, headers, model_id)
             if resp.is_success:
                 openai_response = resp.json()
                 # Record usage from the OpenAI response
@@ -571,7 +665,7 @@ class ProxyHandler:
                 return
 
             try:
-                async with self._client.stream("POST", url, json=body, headers=headers) as resp:
+                async with self._stream_with_retry(url, body, headers, model_id) as resp:
                     if not resp.is_success:
                         # Non-streaming error
                         error_text = await resp.aread()
@@ -635,7 +729,7 @@ class ProxyHandler:
             return
 
         try:
-            async with self._client.stream("POST", url, json=body, headers=headers) as resp:
+            async with self._stream_with_retry(url, body, headers, model_id) as resp:
                 if not resp.is_success:
                     error_text = await resp.aread()
                     yield f"data: {{\"error\":{json.dumps(error_text.decode()[:500])}}}\n\n"

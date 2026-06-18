@@ -167,15 +167,25 @@ def extract_responses_usage(body: dict) -> tuple[int, int, int, int, int]:
 
 
 def extract_anthropic_usage(body: dict) -> tuple[int, int, int, int, int]:
-    """Extract (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)."""
+    """Extract (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens).
+
+    Anthropic reports `input_tokens` exclusive of cache reads/writes (they are
+    separate, additive fields), unlike OpenAI's `prompt_tokens` which already
+    includes cached tokens. The cost formula in record() assumes input_tokens
+    is inclusive, so we fold the cache counts in here — otherwise the cache-read
+    discount over-subtracts and the cost can go negative.
+    """
     usage = body.get("usage", {})
     if not isinstance(usage, dict):
         return 0, 0, 0, 0, 0
+    base_input = usage.get("input_tokens", 0) or 0
+    cache_read = usage.get("cache_read_input_tokens", 0) or 0
+    cache_write = usage.get("cache_creation_input_tokens", 0) or 0
     return (
-        usage.get("input_tokens", 0) or 0,                                   # input_tokens
+        base_input + cache_read + cache_write,                               # input_tokens (inclusive, matches OpenAI)
         usage.get("output_tokens", 0) or 0,                                  # output_tokens
-        usage.get("cache_read_input_tokens", 0) or 0,                        # cache_read_tokens
-        usage.get("cache_creation_input_tokens", 0) or 0,                    # cache_write_tokens
+        cache_read,                                                          # cache_read_tokens
+        cache_write,                                                         # cache_write_tokens
         0,                                                                   # Anthropic doesn't have reasoning_tokens
     )
 

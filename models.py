@@ -213,7 +213,7 @@ class ModelStore:
             self._raw_response = data  # keep untouched response for /v1/models/raw
             self._last_refresh = time.time()
 
-        logger.info(f"Refreshed models: {len(models)} available")
+        logger.debug(f"Refreshed models: {len(models)} available")
 
     def get_model(self, model_id: str) -> Optional[CopilotModel]:
         """Get a single model by ID."""
