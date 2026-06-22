@@ -440,8 +440,8 @@ def extract_anthropic_usage(body: dict) -> tuple[int, int, int, int, int]:
 # Column headers (model left-aligned, others right-aligned)
 _COL_H = ["Model", "In", "Out", "Hit", "Wrt", "$/Mo", "$/Wk", "$/Day"]
 
-# Whether we've already printed the table once (for cursor save/restore)
-_first_print = True
+# Track how many lines the last table occupied (for cursor-positioned refresh)
+_last_lines = 0
 
 
 def _build_table(tracker: "UsageTracker") -> list[str]:
@@ -530,31 +530,31 @@ def _build_table(tracker: "UsageTracker") -> list[str]:
 def print_usage_table(tracker: "UsageTracker", output: TextIO | None = None) -> None:
     """Print a compact usage table, refreshing in-place via ANSI escapes.
 
-    Uses DEC save/restore cursor (ESC 7 / ESC 8) — no line-counting
-    needed, works reliably in Warp, iTerm2, Windows Terminal, etc.
-
-    First call saves the cursor position at the top of the table.
-    Subsequent calls restore that position, clear below, and reprint
-    — values appear to update in-place.
+    First call prints normally. Subsequent calls restore the saved cursor
+    position, clear below, and reprint — values appear to update in-place.
 
     Args:
         tracker: The UsageTracker to query.
         output: File-like to write to (default: sys.stderr).
     """
-    global _first_print
+    global _last_lines
 
     if output is None:
         output = sys.stderr
 
     lines = _build_table(tracker)
 
-    if _first_print:
-        output.write("\n7")
-        _first_print = False
+    if _last_lines > 0:
+        # Move cursor back up to where the last table started
+        output.write(f"\033[{_last_lines}A")
+        # Clear from cursor to end of screen
+        output.write("\033[J")
     else:
-        output.write("8[J")
+        # First print: ensure we start on a fresh line
+        output.write("\n")
 
     for line in lines:
         output.write(line + "\n")
 
     output.flush()
+    _last_lines = len(lines)
