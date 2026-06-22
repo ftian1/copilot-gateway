@@ -41,6 +41,11 @@ class Config:
     verbose: bool = False  # dump raw Copilot /models response at startup
 
     @property
+    def data_dir(self) -> Path:
+        """Return the directory where gateway data is persisted."""
+        return Path(self.token_file).parent
+
+    @property
     def api_base_url(self) -> str:
         """Return the GitHub Copilot API base URL."""
         if self.enterprise_domain:

@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -79,6 +80,61 @@ def _retry_delay(resp: "httpx.Response", attempt: int) -> float:
     if retry_after is not None:
         return min(retry_after, MAX_RETRY_DELAY)
     return min(DEFAULT_RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
+
+
+# ── error logging ────────────────────────────────────────────────
+
+def _log_http_error(
+    url: str,
+    req_headers: dict[str, str],
+    req_body: dict | None,
+    resp_status: int | None,
+    resp_headers: dict | None,
+    resp_body: str | None,
+    elapsed_ms: float,
+    model_id: str = "",
+    error: str | None = None,
+) -> None:
+    """Log full HTTP request and response details for errored requests.
+
+    Redacts the Authorization token and truncates bodies > 2 KiB
+    so the log remains compact without losing critical information.
+    """
+    # --- sanitise request headers ---
+    safe_rh = dict(req_headers)
+    if "Authorization" in safe_rh:
+        auth = safe_rh["Authorization"]
+        if auth.startswith("Bearer "):
+            safe_rh["Authorization"] = "Bearer …" + auth[-8:]
+
+    # --- request body ---
+    req_str = json.dumps(req_body, ensure_ascii=False) if req_body is not None else "(none)"
+    if len(req_str) > 2048:
+        req_str = req_str[:2048] + " …(truncated)"
+
+    # --- response body ---
+    resp_str = resp_body or "(none)"
+    if len(resp_str) > 2048:
+        resp_str = resp_str[:2048] + " …(truncated)"
+
+    # --- response headers ---
+    safe_resh = dict(resp_headers) if resp_headers else {}
+
+    parts = [
+        f"HTTP error  model={model_id}  elapsed={elapsed_ms:.0f}ms",
+        f"  >> REQUEST  POST {url}",
+        f"  >> headers  {json.dumps(safe_rh, ensure_ascii=False)}",
+        f"  >> body     {req_str}",
+    ]
+    if error:
+        parts.append(f"  << ERROR    {error}")
+    if resp_status is not None:
+        parts.append(f"  << RESPONSE {resp_status}")
+        parts.append(f"  << headers  {json.dumps(safe_resh, ensure_ascii=False)}")
+        parts.append(f"  << body     {resp_str}")
+
+    logger.error("\n".join(parts))
+
 
 # Regex for detecting GPT-5+ models that should use Responses API
 GPT5_PATTERN = re.compile(r"^gpt-(\d+)")
@@ -299,7 +355,16 @@ class ProxyHandler:
         attempt = 0
         while True:
             cm = self._client.stream("POST", url, json=body, headers=headers)
-            resp = await cm.__aenter__()
+            try:
+                resp = await cm.__aenter__()
+            except httpx.ReadTimeout:
+                logger.warning(
+                    f"Upstream read timeout (model={model_id}, stream), "
+                    f"retrying once"
+                )
+                await cm.__aexit__(None, None, None)
+                cm = self._client.stream("POST", url, json=body, headers=headers)
+                resp = await cm.__aenter__()
             if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
                 delay = _retry_delay(resp, attempt)
                 logger.warning(
@@ -530,21 +595,36 @@ class ProxyHandler:
         if not self._client:
             raise RuntimeError("ProxyHandler not started")
 
+        t0 = time.monotonic()
         try:
             resp = await self._post_with_retry(url, body, headers, model_id)
+            elapsed_ms = (time.monotonic() - t0) * 1000
             if resp.is_success:
                 anth_response = resp.json()
                 self._record_usage(model_id, anth_response, "anthropic")
                 openai_response = anthropic_to_openai_response(anth_response, model_id)
                 return JSONResponse(openai_response)
             else:
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=resp.status_code,
+                    resp_headers=dict(resp.headers),
+                    resp_body=resp.text[:2048],
+                    elapsed_ms=elapsed_ms,
+                    model_id=model_id,
+                )
                 return Response(
                     content=resp.content,
                     status_code=resp.status_code,
                     media_type="application/json",
                 )
         except httpx.RequestError as e:
-            logger.error(f"Upstream Anthropic request failed: {e}")
+            _log_http_error(
+                url, headers, body,
+                resp_status=None, resp_headers=None, resp_body=None,
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                model_id=model_id, error=str(e),
+            )
             return JSONResponse(
                 {"error": {"type": "upstream_error", "message": str(e)}},
                 status_code=502,
@@ -563,11 +643,21 @@ class ProxyHandler:
                 yield f"data: {{\"error\":\"Client not started\"}}\n\n"
                 return
 
+            t0 = time.monotonic()
             try:
                 async with self._stream_with_retry(url, body, headers, model_id) as resp:
                     if not resp.is_success:
                         error_text = await resp.aread()
-                        yield f"data: {{\"error\":{json.dumps(error_text.decode()[:500])}}}\n\n"
+                        err_body = error_text.decode()[:2048]
+                        _log_http_error(
+                            url, headers, body,
+                            resp_status=resp.status_code,
+                            resp_headers=dict(resp.headers),
+                            resp_body=err_body,
+                            elapsed_ms=(time.monotonic() - t0) * 1000,
+                            model_id=model_id,
+                        )
+                        yield f"data: {{\"error\":{json.dumps(err_body[:500])}}}\n\n"
                         return
 
                     buffer = ""
@@ -587,10 +677,20 @@ class ProxyHandler:
                                 yield converted
 
             except httpx.RequestError as e:
-                logger.error(f"Upstream streaming request failed: {e}")
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=None, resp_headers=None, resp_body=None,
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    model_id=model_id, error=str(e),
+                )
                 yield f"data: {{\"error\":{json.dumps(str(e))}}}\n\n"
             except Exception as e:
-                logger.exception(f"Unexpected error in SSE stream: {e}")
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=None, resp_headers=None, resp_body=None,
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    model_id=model_id, error=f"unexpected: {e}",
+                )
                 yield f"data: {{\"error\":{json.dumps(str(e))}}}\n\n"
 
         return StreamingResponse(
@@ -632,16 +732,34 @@ class ProxyHandler:
                 },
             )
         else:
-            resp = await self._post_with_retry(url, body, headers, model_id)
+            t0 = time.monotonic()
+            try:
+                resp = await self._post_with_retry(url, body, headers, model_id)
+            except httpx.RequestError as e:
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=None, resp_headers=None, resp_body=None,
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    model_id=model_id, error=str(e),
+                )
+                return JSONResponse(
+                    {"error": {"type": "upstream_error", "message": str(e)}},
+                    status_code=502,
+                )
+            elapsed_ms = (time.monotonic() - t0) * 1000
             if resp.is_success:
                 try:
                     self._record_usage(model_id, resp.json(), api_type)
                 except Exception:
                     pass
             else:
-                logger.error(
-                    f"Upstream {resp.status_code} (model={model_id}): "
-                    f"{resp.text[:300]}"
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=resp.status_code,
+                    resp_headers=dict(resp.headers),
+                    resp_body=resp.text[:2048],
+                    elapsed_ms=elapsed_ms,
+                    model_id=model_id,
                 )
             return Response(
                 content=resp.content,
@@ -663,8 +781,10 @@ class ProxyHandler:
         if not self._client:
             raise RuntimeError("ProxyHandler not started")
 
+        t0 = time.monotonic()
         try:
             resp = await self._post_with_retry(url, body, headers, model_id)
+            elapsed_ms = (time.monotonic() - t0) * 1000
             if resp.is_success:
                 openai_response = resp.json()
                 # Record usage from the OpenAI response
@@ -674,13 +794,26 @@ class ProxyHandler:
                 return JSONResponse(anthropic_response)
             else:
                 # Pass through errors
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=resp.status_code,
+                    resp_headers=dict(resp.headers),
+                    resp_body=resp.text[:2048],
+                    elapsed_ms=elapsed_ms,
+                    model_id=model_id,
+                )
                 return Response(
                     content=resp.content,
                     status_code=resp.status_code,
                     media_type="application/json",
                 )
         except httpx.RequestError as e:
-            logger.error(f"Upstream request failed: {e}")
+            _log_http_error(
+                url, headers, body,
+                resp_status=None, resp_headers=None, resp_body=None,
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                model_id=model_id, error=str(e),
+            )
             return JSONResponse(
                 {"error": {"type": "upstream_error", "message": str(e)}},
                 status_code=502,
@@ -701,12 +834,22 @@ class ProxyHandler:
                 yield f"event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":\"Client not started\"}}}}\n\n"
                 return
 
+            t0 = time.monotonic()
             try:
                 async with self._stream_with_retry(url, body, headers, model_id) as resp:
                     if not resp.is_success:
                         # Non-streaming error
                         error_text = await resp.aread()
-                        yield f"event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":{json.dumps(error_text.decode()[:500])}}}}}\n\n"
+                        err_body = error_text.decode()[:2048]
+                        _log_http_error(
+                            url, headers, body,
+                            resp_status=resp.status_code,
+                            resp_headers=dict(resp.headers),
+                            resp_body=err_body,
+                            elapsed_ms=(time.monotonic() - t0) * 1000,
+                            model_id=model_id,
+                        )
+                        yield f"event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":{json.dumps(err_body[:500])}}}}}\n\n"
                         return
 
                     buffer = ""
@@ -732,10 +875,20 @@ class ProxyHandler:
                     yield finalize_anthropic_stream(request_id)
 
             except httpx.RequestError as e:
-                logger.error(f"Upstream streaming request failed: {e}")
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=None, resp_headers=None, resp_body=None,
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    model_id=model_id, error=str(e),
+                )
                 yield f"event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":{json.dumps(str(e))}}}}}\n\n"
             except Exception as e:
-                logger.exception(f"Unexpected error in SSE stream: {e}")
+                _log_http_error(
+                    url, headers, body,
+                    resp_status=None, resp_headers=None, resp_body=None,
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    model_id=model_id, error=f"unexpected: {e}",
+                )
                 yield f"event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":{json.dumps(str(e))}}}}}\n\n"
 
         return StreamingResponse(
@@ -765,11 +918,21 @@ class ProxyHandler:
             yield f"data: {{\"error\":\"Client not started\"}}\n\n"
             return
 
+        t0 = time.monotonic()
         try:
             async with self._stream_with_retry(url, body, headers, model_id) as resp:
                 if not resp.is_success:
                     error_text = await resp.aread()
-                    yield f"data: {{\"error\":{json.dumps(error_text.decode()[:500])}}}\n\n"
+                    err_body = error_text.decode()[:2048]
+                    _log_http_error(
+                        url, headers, body,
+                        resp_status=resp.status_code,
+                        resp_headers=dict(resp.headers),
+                        resp_body=err_body,
+                        elapsed_ms=(time.monotonic() - t0) * 1000,
+                        model_id=model_id,
+                    )
+                    yield f"data: {{\"error\":{json.dumps(err_body[:500])}}}\n\n"
                     return
 
                 text_buf = ""
@@ -785,7 +948,12 @@ class ProxyHandler:
                     self._check_sse_line(text_buf.strip(), model_id, api_type)
 
         except httpx.RequestError as e:
-            logger.error(f"Upstream stream failed: {e}")
+            _log_http_error(
+                url, headers, body,
+                resp_status=None, resp_headers=None, resp_body=None,
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                model_id=model_id, error=str(e),
+            )
             yield f"data: {{\"error\":{json.dumps(str(e))}}}\n\n"
 
     # ── usage tracking ─────────────────────────────────────────

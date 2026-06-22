@@ -1,42 +1,243 @@
 """
-Per-request token usage tracker with cost estimation.
+Per-request token usage tracker with cost estimation and cumulative billing.
 
 GitHub Copilot moved to usage-based billing (AI Credits) on 2026-06-01.
 One AI Credit = $0.01 USD. Models are priced per 1M tokens.
 
-This module records token counts from API responses and multiplies by
-the per-model pricing from the /models endpoint to estimate spending.
+Usage data is persisted to disk as daily aggregates so costs survive
+gateway restarts and accumulate across the current month, week, and day.
 """
 
 import asyncio
+import json
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import date, datetime
+from pathlib import Path
+from typing import Optional, TextIO
 
 logger = logging.getLogger(__name__)
 
 
+# ── date helpers ──────────────────────────────────────────────────
+
+def _today() -> str:
+    """ISO date string for today, e.g. '2026-06-22'."""
+    return date.today().isoformat()
+
+
+def _current_month_key() -> str:
+    """Key for the current month, e.g. '2026-06'."""
+    return date.today().strftime("%Y-%m")
+
+
+def _current_week_key() -> str:
+    """Key for the current ISO week, e.g. '2026-W25'."""
+    return date.today().strftime("%Y-W%W")
+
+
+def _current_day_key() -> str:
+    """Key for today, e.g. '2026-06-22' — alias for _today()."""
+    return _today()
+
+
+def _month_from_date(d: str) -> str:
+    """Extract 'YYYY-MM' from a 'YYYY-MM-DD' date string."""
+    return d[:7]
+
+
+def _week_from_date(d: str) -> str:
+    """Extract 'YYYY-Www' from a 'YYYY-MM-DD' date string."""
+    return date.fromisoformat(d).strftime("%Y-W%W")
+
+
+# ── token abbreviation ────────────────────────────────────────────
+
+def _k(n: int) -> str:
+    """Abbreviate token count: 200000 → '200K', 1500000 → '1.5M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n // 1000}K"
+    return str(n)
+
+
+# ── data class ────────────────────────────────────────────────────
+
 @dataclass
 class ModelUsage:
-    """Cumulative usage for a single model."""
+    """Cumulative usage for a single model (in-memory, current session)."""
 
     requests: int = 0
-    input_tokens: int = 0        # total input (includes cache reads + writes)
+    input_tokens: int = 0          # total input (includes cache reads + writes)
     output_tokens: int = 0
-    cache_read_tokens: int = 0   # tokens served from cache (billed at discount)
-    cache_write_tokens: int = 0  # tokens written to cache (billed at input price)
+    cache_read_tokens: int = 0     # tokens served from cache (billed at discount)
+    cache_write_tokens: int = 0    # tokens written to cache (billed at input price)
     reasoning_tokens: int = 0
     cost_usd: float = 0.0
 
 
-class UsageTracker:
-    """Thread-safe tracker for token usage and cost estimation."""
+# ── tracker ───────────────────────────────────────────────────────
 
-    def __init__(self):
+class UsageTracker:
+    """Thread-safe tracker for token usage with cumulative billing.
+
+    Persists daily aggregates to disk so costs accumulate across
+    gateway restarts within the same billing period (month / week / day).
+    """
+
+    def __init__(self, persist_path: str | None = None):
         self._lock = asyncio.Lock()
         self._usage: dict[str, ModelUsage] = {}
         self._started_at: float = time.time()
+
+        # Persisted daily aggregates:
+        #   { "2026-06-22": { model_id: {input_tokens, output_tokens,
+        #     cache_read_tokens, cache_write_tokens, cost_usd} } }
+        self._persist_path = persist_path
+        self._daily: dict[str, dict[str, dict]] = {}
+        self._dirty = False
+        self._last_flush = 0.0
+        if persist_path:
+            self._load_persisted()
+
+    # ── persistence ────────────────────────────────────────────
+
+    def _load_persisted(self) -> None:
+        """Load daily usage aggregates from disk."""
+        try:
+            path = Path(self._persist_path)
+            if not path.exists():
+                logger.info("No persisted usage file — starting fresh")
+                return
+            data = json.loads(path.read_text())
+            self._daily = data.get("daily", {})
+            if self._daily:
+                months = len({_month_from_date(d) for d in self._daily})
+                logger.info(
+                    f"Loaded persisted usage: {len(self._daily)} day(s) "
+                    f"across {months} month(s)"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load persisted usage: {e}")
+            self._daily = {}
+
+    def _flush(self) -> None:
+        """Write daily aggregates to disk (only if dirty)."""
+        if not self._persist_path or not self._dirty:
+            return
+
+        now = time.time()
+        # Debounce: flush at most once per 2 seconds
+        if now - self._last_flush < 2.0:
+            return
+        self._last_flush = now
+        self._dirty = False
+
+        try:
+            path = Path(self._persist_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "daily": self._daily,
+                "updated_at": datetime.now().isoformat(),
+            }
+            path.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            logger.warning(f"Failed to persist usage: {e}")
+
+    def flush(self) -> None:
+        """Public: force a sync of persisted usage (call on shutdown)."""
+        self._dirty = True
+        self._last_flush = 0.0  # bypass debounce
+        self._flush()
+
+    def _update_daily_aggregate(
+        self,
+        model_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        cost_usd: float,
+    ) -> None:
+        """Merge a single request's usage into today's daily bucket."""
+        today = _today()
+        if today not in self._daily:
+            self._daily[today] = {}
+        if model_id not in self._daily[today]:
+            self._daily[today][model_id] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cost_usd": 0.0,
+            }
+        d = self._daily[today][model_id]
+        d["input_tokens"] += input_tokens
+        d["output_tokens"] += output_tokens
+        d["cache_read_tokens"] += cache_read_tokens
+        d["cache_write_tokens"] += cache_write_tokens
+        d["cost_usd"] += cost_usd
+
+    # ── period cost helpers ────────────────────────────────────
+
+    def _period_costs(self) -> dict[str, dict[str, float]]:
+        """Compute costs by model for the current month, week, day.
+
+        Uses _daily as the single source of truth — it is always
+        up-to-date (updated on every record() call) and includes
+        both live session data and pre-restart persisted data.
+
+        Returns:
+            { model_id: {"month": float, "week": float, "day": float} }
+        """
+        month_key = _current_month_key()
+        week_key = _current_week_key()
+        day_key = _current_day_key()
+
+        costs: dict[str, dict[str, float]] = {}
+
+        for d, models in self._daily.items():
+            in_month = _month_from_date(d) == month_key
+            in_week = _week_from_date(d) == week_key
+            in_day = d == day_key
+
+            if not (in_month or in_week or in_day):
+                continue
+
+            for mid, m in models.items():
+                if mid not in costs:
+                    costs[mid] = {"month": 0.0, "week": 0.0, "day": 0.0}
+                c = m.get("cost_usd", 0.0)
+                if in_month:
+                    costs[mid]["month"] += c
+                if in_week:
+                    costs[mid]["week"] += c
+                if in_day:
+                    costs[mid]["day"] += c
+
+        return costs
+
+    def _today_tokens(self) -> dict[str, dict[str, int]]:
+        """Compute today's token totals by model from _daily only.
+
+        _daily is always current (updated on every record call), so
+        no need to merge with _usage separately.
+        """
+        today = _today()
+        totals: dict[str, dict[str, int]] = {}
+
+        for mid, m in self._daily.get(today, {}).items():
+            totals[mid] = {
+                "input_tokens": m.get("input_tokens", 0),
+                "output_tokens": m.get("output_tokens", 0),
+                "cache_read_tokens": m.get("cache_read_tokens", 0),
+                "cache_write_tokens": m.get("cache_write_tokens", 0),
+            }
+
+        return totals
 
     # ── public API ──────────────────────────────────────────────
 
@@ -71,7 +272,9 @@ class UsageTracker:
 
         # Charge all input at full price, then apply cache-read discount
         input_cost = input_tokens / 1_000_000 * input_price_per_m
-        cache_discount = cache_read_tokens / 1_000_000 * (input_price_per_m - cache_read_price_per_m)
+        cache_discount = (
+            cache_read_tokens / 1_000_000 * (input_price_per_m - cache_read_price_per_m)
+        )
         output_cost = output_tokens / 1_000_000 * output_price_per_m
         cost = input_cost - cache_discount + output_cost
 
@@ -89,33 +292,68 @@ class UsageTracker:
             u.reasoning_tokens += reasoning_tokens
             u.cost_usd += cost
 
+            # Persist to daily aggregate
+            self._update_daily_aggregate(
+                model_id,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                cost,
+            )
+            self._dirty = True
+
+        # Flush outside the lock (debounced internally)
+        self._flush()
+
         logger.debug(
             f"Usage: model={model_id} in={input_tokens} out={output_tokens} "
             f"cache_r={cache_read_tokens} cache_w={cache_write_tokens} cost=${cost:.6f}"
         )
 
     def snapshot(self) -> dict:
-        """Return a snapshot of all usage data."""
+        """Return a snapshot of all usage data with period costs."""
+        period = self._period_costs()
+        today = self._today_tokens()
+
         result: dict[str, dict] = {}
-        total_cost = 0.0
+        total_cost_month = 0.0
+        total_cost_week = 0.0
+        total_cost_day = 0.0
         total_requests = 0
         total_input = 0
         total_output = 0
+        total_cache_r = 0
+        total_cache_w = 0
 
-        for model_id, u in sorted(self._usage.items()):
-            result[model_id] = {
-                "requests": u.requests,
-                "input_tokens": u.input_tokens,
-                "output_tokens": u.output_tokens,
-                "cache_read_tokens": u.cache_read_tokens,
-                "cache_write_tokens": u.cache_write_tokens,
-                "reasoning_tokens": u.reasoning_tokens,
-                "cost_usd": round(u.cost_usd, 6),
+        # Collect all model IDs from both session and period data
+        all_ids = set(self._usage.keys()) | set(period.keys()) | set(today.keys())
+
+        for mid in sorted(all_ids):
+            u = self._usage.get(mid)
+            t = today.get(mid, {})
+            p = period.get(mid, {"month": 0.0, "week": 0.0, "day": 0.0})
+
+            result[mid] = {
+                "requests": u.requests if u else 0,
+                "input_tokens": t.get("input_tokens", 0),
+                "output_tokens": t.get("output_tokens", 0),
+                "cache_read_tokens": t.get("cache_read_tokens", 0),
+                "cache_write_tokens": t.get("cache_write_tokens", 0),
+                "reasoning_tokens": u.reasoning_tokens if u else 0,
+                "cost_month": round(p["month"], 6),
+                "cost_week": round(p["week"], 6),
+                "cost_day": round(p["day"], 6),
             }
-            total_cost += u.cost_usd
-            total_requests += u.requests
-            total_input += u.input_tokens
-            total_output += u.output_tokens
+            total_cost_month += p["month"]
+            total_cost_week += p["week"]
+            total_cost_day += p["day"]
+            if u:
+                total_requests += u.requests
+            total_input += t.get("input_tokens", 0)
+            total_output += t.get("output_tokens", 0)
+            total_cache_r += t.get("cache_read_tokens", 0)
+            total_cache_w += t.get("cache_write_tokens", 0)
 
         return {
             "models": result,
@@ -123,15 +361,22 @@ class UsageTracker:
                 "requests": total_requests,
                 "input_tokens": total_input,
                 "output_tokens": total_output,
-                "cost_usd": round(total_cost, 6),
+                "cache_read_tokens": total_cache_r,
+                "cache_write_tokens": total_cache_w,
+                "cost_month": round(total_cost_month, 6),
+                "cost_week": round(total_cost_week, 6),
+                "cost_day": round(total_cost_day, 6),
             },
             "uptime_seconds": round(time.time() - self._started_at, 0),
         }
 
     def reset(self) -> None:
-        """Reset all usage counters."""
+        """Reset all usage counters (session only; persisted data is untouched)."""
         self._usage.clear()
         self._started_at = time.time()
+
+
+# ── usage extraction (unchanged) ──────────────────────────────────
 
 
 def extract_openai_usage(body: dict) -> tuple[int, int, int, int, int]:
@@ -142,11 +387,11 @@ def extract_openai_usage(body: dict) -> tuple[int, int, int, int, int]:
     prompt_details = usage.get("prompt_tokens_details", {}) or {}
     completion_details = usage.get("completion_tokens_details", {}) or {}
     return (
-        usage.get("prompt_tokens", 0) or 0,                                  # input_tokens
-        usage.get("completion_tokens", 0) or 0,                              # output_tokens
-        prompt_details.get("cached_tokens", 0) or 0,                         # cache_read_tokens
-        0,                                                                   # OpenAI doesn't report cache writes separately
-        completion_details.get("reasoning_tokens", 0) or 0,                  # reasoning_tokens
+        usage.get("prompt_tokens", 0) or 0,
+        usage.get("completion_tokens", 0) or 0,
+        prompt_details.get("cached_tokens", 0) or 0,
+        0,  # OpenAI doesn't report cache writes separately
+        completion_details.get("reasoning_tokens", 0) or 0,
     )
 
 
@@ -158,11 +403,11 @@ def extract_responses_usage(body: dict) -> tuple[int, int, int, int, int]:
     input_details = usage.get("input_tokens_details", {}) or {}
     output_details = usage.get("output_tokens_details", {}) or {}
     return (
-        usage.get("input_tokens", 0) or 0,                                   # input_tokens
-        usage.get("output_tokens", 0) or 0,                                  # output_tokens
-        input_details.get("cached_tokens", 0) or 0,                          # cache_read_tokens
-        0,                                                                   # OpenAI doesn't report cache writes
-        output_details.get("reasoning_tokens", 0) or 0,                      # reasoning_tokens
+        usage.get("input_tokens", 0) or 0,
+        usage.get("output_tokens", 0) or 0,
+        input_details.get("cached_tokens", 0) or 0,
+        0,  # OpenAI doesn't report cache writes
+        output_details.get("reasoning_tokens", 0) or 0,
     )
 
 
@@ -182,86 +427,134 @@ def extract_anthropic_usage(body: dict) -> tuple[int, int, int, int, int]:
     cache_read = usage.get("cache_read_input_tokens", 0) or 0
     cache_write = usage.get("cache_creation_input_tokens", 0) or 0
     return (
-        base_input + cache_read + cache_write,                               # input_tokens (inclusive, matches OpenAI)
-        usage.get("output_tokens", 0) or 0,                                  # output_tokens
-        cache_read,                                                          # cache_read_tokens
-        cache_write,                                                         # cache_write_tokens
-        0,                                                                   # Anthropic doesn't have reasoning_tokens
+        base_input + cache_read + cache_write,
+        usage.get("output_tokens", 0) or 0,
+        cache_read,
+        cache_write,
+        0,  # Anthropic doesn't have reasoning_tokens
     )
 
 
-def _k(n: int) -> str:
-    """Abbreviate token count: 200000 → 200K."""
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    return f"{n//1000}K"
+# ── ANSI table printer ────────────────────────────────────────────
+
+# Column headers (model left-aligned, others right-aligned)
+_COL_H = ["Model", "In", "Out", "Hit", "Wrt", "$/Mo", "$/Wk", "$/Day"]
+
+# Whether we've already printed the table once (for cursor save/restore)
+_first_print = True
 
 
-# Last printed snapshot hash — only reprint when usage changes
-_last_hash = ""
+def _build_table(tracker: "UsageTracker") -> list[str]:
+    """Build a compact usage table — column widths auto-sized to data."""
+    period = tracker._period_costs()
+    today = tracker._today_tokens()
 
+    all_ids = (
+        set(tracker._usage.keys())
+        | set(period.keys())
+        | set(today.keys())
+    )
 
-def print_usage_table(tracker: "UsageTracker") -> None:
-    """Print a compact running cost summary to stderr.
+    if not all_ids:
+        return ["── Usage ── (no requests yet, waiting...)"]
 
-    Only prints when token counts change — no repeated output when idle.
-    """
-    import sys
+    # ── collect data rows as string tuples ─────────────────────
+    _MAX_MODEL = 22
+    rows: list[tuple] = []
+    totals = [0, 0, 0, 0, 0.0, 0.0, 0.0]
 
-    global _last_hash
+    for mid in sorted(all_ids):
+        t = today.get(mid, {})
+        p = period.get(mid, {"month": 0.0, "week": 0.0, "day": 0.0})
 
-    snap = tracker.snapshot()
-    models = snap.get("models", {})
-    totals = snap.get("totals", {})
+        in_tok  = t.get("input_tokens", 0)
+        out_tok = t.get("output_tokens", 0)
+        hit     = t.get("cache_read_tokens", 0)
+        wrt     = t.get("cache_write_tokens", 0)
+        cm, cw, cd = p["month"], p["week"], p["day"]
 
-    # Skip if nothing changed
-    h = f"{len(models)}:{totals.get('input_tokens',0)}:{totals.get('output_tokens',0)}"
-    if h == _last_hash and _last_hash != "":
-        return
-    _last_hash = h
+        if in_tok == 0 and out_tok == 0 and cm == 0 and cw == 0 and cd == 0:
+            continue
 
-    if not models:
-        sys.stderr.write("── Usage ── (no requests yet, waiting...)\n")
-        sys.stderr.flush()
-        return
+        totals[0] += in_tok
+        totals[1] += out_tok
+        totals[2] += hit
+        totals[3] += wrt
+        totals[4] += cm
+        totals[5] += cw
+        totals[6] += cd
 
-    # Build all lines
+        name = mid
+        if len(name) > _MAX_MODEL:
+            name = name[:_MAX_MODEL - 1] + "…"
+
+        rows.append((
+            name,
+            _k(in_tok), _k(out_tok), _k(hit), _k(wrt),
+            f"${cm:.2f}", f"${cw:.2f}", f"${cd:.2f}",
+        ))
+
+    total_tup = (
+        "TOTAL", _k(totals[0]), _k(totals[1]), _k(totals[2]), _k(totals[3]),
+        f"${totals[4]:.2f}", f"${totals[5]:.2f}", f"${totals[6]:.2f}",
+    )
+
+    # ── auto-size column widths ────────────────────────────────
+    widths = [len(h) for h in _COL_H]
+    for row in rows + [total_tup]:
+        for i, cell in enumerate(row):
+            w = len(str(cell))
+            if w > widths[i]:
+                widths[i] = w
+
+    # ── build format string ────────────────────────────────────
+    # i=0 left-aligned, rest right-aligned; " │ " column separator
+    fmts = [f"%-{widths[0]}s"] + [f"%{w}s" for w in widths[1:]]
+    row_fmt = " │ ".join(fmts)
+    sep = "─" * (sum(widths) + 3 * (len(widths) - 1))
+
+    # ── render ─────────────────────────────────────────────────
     lines: list[str] = []
-    lines.append("── Usage ──")
-    for mid, u in sorted(models.items()):
-        parts = [
-            f"  {mid:<22s}  req:{u['requests']:>5d}  "
-            f"in:{_k(u['input_tokens']):>6s}  out:{_k(u['output_tokens']):>6s}",
-        ]
-        if u["cache_read_tokens"] > 0 or u["cache_write_tokens"] > 0:
-            parts.append(
-                f"  cache_r:{_k(u['cache_read_tokens']):>5s}  cache_w:{_k(u['cache_write_tokens']):>5s}"
-            )
-        parts.append(f"  ${u['cost_usd']:.4f}")
-        lines.append("".join(parts))
+    lines.append(row_fmt % tuple(_COL_H))
+    lines.append(sep)
 
-    # TOTAL line
-    total_parts = [
-        f"  {'TOTAL':<22s}  req:{totals['requests']:>5d}  "
-        f"in:{_k(totals['input_tokens']):>6s}  out:{_k(totals['output_tokens']):>6s}",
-    ]
-    total_cache_r = sum(u["cache_read_tokens"] for u in models.values())
-    total_cache_w = sum(u["cache_write_tokens"] for u in models.values())
-    if total_cache_r > 0 or total_cache_w > 0:
-        total_parts.append(
-            f"  cache_r:{_k(total_cache_r):>5s}  cache_w:{_k(total_cache_w):>5s}"
-        )
-    total_parts.append(f"  ${totals['cost_usd']:.4f}")
-    lines.append("".join(total_parts))
+    for row in rows:
+        lines.append(row_fmt % row)
 
-    max_w = max(len(line) for line in lines)
-    sep = "─" * max_w
+    lines.append(sep)
+    lines.append(row_fmt % total_tup)
 
-    out: list[str] = []
-    out.append("── Usage ──")
-    out.append(sep)
-    out.extend(lines[1:])
-    out.append(sep)
+    return lines
 
-    sys.stderr.write("\n".join(out) + "\n")
-    sys.stderr.flush()
+
+def print_usage_table(tracker: "UsageTracker", output: TextIO | None = None) -> None:
+    """Print a compact usage table, refreshing in-place via ANSI escapes.
+
+    Uses DEC save/restore cursor (ESC 7 / ESC 8) — no line-counting
+    needed, works reliably in Warp, iTerm2, Windows Terminal, etc.
+
+    First call saves the cursor position at the top of the table.
+    Subsequent calls restore that position, clear below, and reprint
+    — values appear to update in-place.
+
+    Args:
+        tracker: The UsageTracker to query.
+        output: File-like to write to (default: sys.stderr).
+    """
+    global _first_print
+
+    if output is None:
+        output = sys.stderr
+
+    lines = _build_table(tracker)
+
+    if _first_print:
+        output.write("\n7")
+        _first_print = False
+    else:
+        output.write("8[J")
+
+    for line in lines:
+        output.write(line + "\n")
+
+    output.flush()

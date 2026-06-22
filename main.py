@@ -62,13 +62,19 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
 
 
-# ── CLI parsing (runs first so --help exits cleanly) ───────────
+# ── config (loaded early so --help works) ──────────────────────
+
+config = load_config()
+
+
+# ── CLI parsing (runs early so --help/--version exit cleanly) ──
 
 def _parse_args() -> None:
     """Parse CLI arguments and apply them to the global config.
 
     Called at module level so --help / --version exit before we
-    initialise auth, models, or the server.
+    initialise auth, models, or the server.  Does NOT touch logging
+    — that is configured later, after log redirection.
     """
     parser = argparse.ArgumentParser(
         description="GitHub Copilot Gateway — OpenAI & Anthropic LLM proxy",
@@ -101,9 +107,6 @@ def _parse_args() -> None:
 
     if args.verbose:
         config.verbose = True
-        # Verbose mode surfaces the demoted debug-level proxy/model logs
-        # (field stripping, thinking conversion, model refresh, per-request usage).
-        logging.getLogger().setLevel(logging.DEBUG)
     if args.port is not None:
         config.port = args.port
     if args.enterprise is not None:
@@ -112,10 +115,38 @@ def _parse_args() -> None:
         os.environ["GATEWAY_NO_AUTH_PROMPT"] = "1"
 
 
+_parse_args()  # exits early on --help / --version
+
+
+# ── log redirection ────────────────────────────────────────────
+
+# Capture original terminal handles before redirecting stdout/stderr.
+# These are used exclusively for the in-place usage table.
+_terminal_out = sys.__stdout__
+_terminal_err = sys.__stderr__
+
+# Ensure the data directory exists
+_data_dir = config.data_dir
+_data_dir.mkdir(parents=True, exist_ok=True)
+
+# Open log files (append mode — survives restarts)
+_stdout_log_path = _data_dir / "gateway.log"
+_stderr_log_path = _data_dir / "gateway.err"
+_stdout_log = open(str(_stdout_log_path), "a")
+_stderr_log = open(str(_stderr_log_path), "a")
+
+# Redirect all stdout / stderr to log files.
+# From this point on, print(), uvicorn output, and tracebacks all land in
+# the log files — only the usage table is written to the terminal.
+sys.stdout = _stdout_log
+sys.stderr = _stderr_log
+
+
 # ── logging ────────────────────────────────────────────────────
 
+# Configure after redirection so log records go to the log file.
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if config.verbose else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
@@ -125,13 +156,26 @@ logger = logging.getLogger("gateway")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
+
+# ── tell user where logs live ──────────────────────────────────
+
+# This is the only message ever printed to the real terminal
+# (before the usage table takes over).
+print(
+    f"── Gateway logs ──\n"
+    f"  stdout → {_stdout_log_path}\n"
+    f"  stderr → {_stderr_log_path}\n"
+    f"────────────────────",
+    file=_terminal_out,
+    flush=True,
+)
+
+
 # ── globals ────────────────────────────────────────────────────
 
-config = load_config()
-_parse_args()  # apply CLI overrides (exits early on --help)
 auth = AuthManager(config)
 models = ModelStore(config, auth)
-usage = UsageTracker()
+usage = UsageTracker(persist_path=str(_data_dir / "usage.json"))
 proxy = ProxyHandler(config, auth, models, usage)
 
 # Track the auth prompt task so we can cancel it on shutdown
@@ -272,10 +316,13 @@ async def _run_startup_auth() -> None:
 # ── usage printer ────────────────────────────────────────────────
 
 async def _print_usage_loop() -> None:
-    """Print running cost summary every 3 seconds."""
+    """Print running cost summary table, refreshing in-place every 3 seconds.
+
+    Writes to the real terminal (not the log file) via ANSI escape codes.
+    """
     while True:
         await asyncio.sleep(3)
-        print_usage_table(usage)
+        print_usage_table(usage, output=_terminal_out)
 
 
 # ── lifespan ───────────────────────────────────────────────────
@@ -296,7 +343,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Start model refresh loop (will retry once we have a token)
     await models.start_refresh_loop()
 
-    # Start usage printer (refreshes every 3 seconds)
+    # Start usage printer (refreshes every 3 seconds on the terminal)
     _usage_task = asyncio.create_task(_print_usage_loop(), name="usage-printer")
 
     # Start auth prompt as a background task — server is already
@@ -324,6 +371,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await models.stop_refresh_loop()
     await proxy.shutdown()
+
+    # Flush persisted usage data before exit
+    usage.flush()
     logger.info("Gateway shut down")
 
 
@@ -382,7 +432,8 @@ async def list_usage():
     """Return cumulative token usage and estimated cost per model.
 
     Token counts come from API response bodies and SSE streams.
-    Costs are computed using per-model pricing from the /models endpoint.
+    Costs are computed using per-model pricing from the /models endpoint
+    and accumulated across the current month, week, and day.
     """
     return JSONResponse(usage.snapshot())
 
