@@ -162,6 +162,38 @@ def _sanitize_anthropic_body(body: dict, model: "CopilotModel | None" = None) ->
         body = {k: v for k, v in body.items() if k not in _ANTHROPIC_UNSUPPORTED_FIELDS}
         logger.debug(f"Stripped unsupported Anthropic fields: {dropped}")
 
+    # ── normalise system: accept "system" role inside messages ────
+    # Many clients (especially OpenAI SDK users) send system prompts as
+    # messages with role="system". The Anthropic Messages API requires a
+    # top-level `system` parameter instead, so we extract and promote them.
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        system_contents: list[dict] = []
+        cleaned_messages: list[dict] = []
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    system_contents.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    system_contents.extend(content)
+            else:
+                cleaned_messages.append(msg)
+        if system_contents:
+            # Merge with existing top-level system parameter if present
+            existing = body.get("system")
+            if existing is None:
+                body["system"] = system_contents
+            elif isinstance(existing, str):
+                body["system"] = [{"type": "text", "text": existing}] + system_contents
+            elif isinstance(existing, list):
+                body["system"] = existing + system_contents
+            body["messages"] = cleaned_messages
+            logger.debug(
+                f"Promoted {len(system_contents)} system content block(s) "
+                f"from messages[] to top-level system parameter"
+            )
+
     # Strip all reasoning fields for models that don't support reasoning at all
     if model and not model.supports_reasoning:
         stripped = [k for k in ("thinking", "output_config") if k in body]
@@ -227,14 +259,19 @@ class ProxyHandler:
     async def _post_with_retry(
         self, url: str, body: dict, headers: dict[str, str], model_id: str = ""
     ) -> "httpx.Response":
-        """POST to upstream, retrying on 429/503 with Retry-After-aware backoff.
+        """POST to upstream, retrying on 429/503 and transient network errors.
 
         Returns the final httpx.Response (success or the last error response).
-        Network errors (httpx.RequestError) are not retried here — callers
-        already translate them into 502s.
+        ReadTimeout is retried once; other RequestErrors propagate to callers.
         """
         assert self._client is not None
-        resp = await self._client.post(url, json=body, headers=headers)
+        try:
+            resp = await self._client.post(url, json=body, headers=headers)
+        except httpx.ReadTimeout as e:
+            logger.warning(
+                f"Upstream read timeout (model={model_id}), retrying once"
+            )
+            resp = await self._client.post(url, json=body, headers=headers)
         attempt = 0
         while resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
             delay = _retry_delay(resp, attempt)
